@@ -1,0 +1,38 @@
+{
+  "manifest_version": 2,
+  "version": "1.0.0",
+  "name": "Better Image",
+  "description": "提供从历史消息提取、裁切、放大图片，并发送上下文图片的工具。",
+  "author": {
+    "name": "SengokuCola",
+    "url": "https://github.com/SengokuCola"
+  },
+  "license": "MIT",
+  "urls": {
+    "repository": "https://github.com/SengokuCola/better_image",
+    "homepage": "https://github.com/SengokuCola/better_image",
+    "documentation": "https://github.com/SengokuCola/better_image",
+    "issues": "https://github.com/SengokuCola/better_image/issues"
+  },
+  "host_application": {
+    "min_version": "1.0.0",
+    "max_version": "1.0.0"
+  },
+  "sdk": {
+    "min_version": "2.0.0",
+    "max_version": "2.99.99"
+  },
+  "dependencies": [],
+  "capabilities": [
+    "message.get_by_id",
+    "send.image"
+  ],
+  "i18n": {
+    "default_locale": "zh-CN",
+    "locales_path": "_locales",
+    "supported_locales": [
+      "zh-CN"
+    ]
+  },
+  "id": "sengokucola.better-image"
+}
