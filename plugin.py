@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from base64 import b64decode, b64encode
 from io import BytesIO
-from typing import Any
+from typing import Any, Mapping
 from urllib.parse import quote_plus, urlparse
 
 from maibot_sdk import MaiBotPlugin, Tool
@@ -23,12 +23,25 @@ logger = logging.getLogger("plugin.better_image")
 MAX_CONTEXT_IMAGES = 32
 MAX_OUTPUT_EDGE = 4096
 DEFAULT_OUTPUT_FORMAT = "png"
+PLUGIN_CONFIG_VERSION = "1.1.0"
 DEFAULT_SEARCH_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 )
 MAX_SEARCH_IMAGE_BYTES = 8 * 1024 * 1024
 MAX_SEARCH_RESULT_IMAGES = 5
+
+DEFAULT_PLUGIN_CONFIG: dict[str, Any] = {
+    "plugin": {
+        "enabled": True,
+        "config_version": PLUGIN_CONFIG_VERSION,
+    },
+    "tools": {
+        "search": True,
+        "get": True,
+        "send_context": True,
+    },
+}
 
 
 def _tool_param(
@@ -301,6 +314,45 @@ def _extract_message_images(message: dict[str, Any]) -> list[tuple[str, bytes]]:
     return images
 
 
+def _deep_copy_value(value: Any) -> Any:
+    """复制插件配置中的简单结构。"""
+
+    if isinstance(value, dict):
+        return _deep_copy_mapping(value)
+    if isinstance(value, list):
+        return [_deep_copy_value(item) for item in value]
+    return value
+
+
+def _deep_copy_mapping(mapping: Mapping[str, Any]) -> dict[str, Any]:
+    """复制配置字典，避免共享默认配置对象。"""
+
+    return {str(key): _deep_copy_value(value) for key, value in mapping.items()}
+
+
+def _merge_mapping(target: dict[str, Any], source: Mapping[str, Any]) -> None:
+    """把用户配置覆盖到默认配置上。"""
+
+    for key, value in source.items():
+        target_key = str(key)
+        target_value = target.get(target_key)
+        if isinstance(target_value, dict) and isinstance(value, Mapping):
+            _merge_mapping(target_value, value)
+        else:
+            target[target_key] = _deep_copy_value(value)
+
+
+def _ensure_mapping(config: dict[str, Any], key: str) -> dict[str, Any]:
+    """确保配置中的某一段是字典。"""
+
+    value = config.get(key)
+    if isinstance(value, dict):
+        return value
+    section: dict[str, Any] = {}
+    config[key] = section
+    return section
+
+
 class BetterImagePlugin(MaiBotPlugin):
     """提供更细粒度图片查看和复用能力的插件。"""
 
@@ -308,6 +360,7 @@ class BetterImagePlugin(MaiBotPlugin):
         super().__init__()
         self._context_images: dict[str, dict[str, Any]] = {}
         self._context_order: list[str] = []
+        self._plugin_config = _deep_copy_mapping(DEFAULT_PLUGIN_CONFIG)
 
     async def on_load(self) -> None:
         """插件加载完成。"""
@@ -317,6 +370,108 @@ class BetterImagePlugin(MaiBotPlugin):
 
         self._context_images.clear()
         self._context_order.clear()
+
+    def get_default_config(self) -> dict[str, Any]:
+        """返回插件默认配置。"""
+
+        return _deep_copy_mapping(DEFAULT_PLUGIN_CONFIG)
+
+    def normalize_plugin_config(self, config_data: Mapping[str, Any] | None) -> tuple[dict[str, Any], bool]:
+        """补齐并规范化插件配置。"""
+
+        normalized_config = self.get_default_config()
+        current_config = _deep_copy_mapping(config_data or {})
+        _merge_mapping(normalized_config, current_config)
+
+        plugin_section = _ensure_mapping(normalized_config, "plugin")
+        plugin_section["enabled"] = bool(plugin_section.get("enabled", True))
+        plugin_section["config_version"] = PLUGIN_CONFIG_VERSION
+
+        tools_section = _ensure_mapping(normalized_config, "tools")
+        for tool_name in ("search", "get", "send_context"):
+            tools_section[tool_name] = bool(tools_section.get(tool_name, True))
+
+        return normalized_config, normalized_config != current_config
+
+    def set_plugin_config(self, config: dict[str, Any]) -> None:
+        """接收运行时注入的插件配置。"""
+
+        normalized_config, _changed = self.normalize_plugin_config(config)
+        self._plugin_config = normalized_config
+
+    def get_webui_config_schema(
+        self,
+        *,
+        plugin_id: str = "",
+        plugin_name: str = "",
+        plugin_version: str = "",
+        plugin_description: str = "",
+        plugin_author: str = "",
+    ) -> dict[str, Any]:
+        """返回 WebUI 配置 Schema。"""
+
+        return {
+            "plugin_id": plugin_id,
+            "plugin_info": {
+                "name": plugin_name or "Better Image",
+                "version": plugin_version,
+                "description": plugin_description,
+                "author": plugin_author,
+            },
+            "sections": {
+                "plugin": {
+                    "title": "插件",
+                    "fields": {
+                        "enabled": {
+                            "type": "boolean",
+                            "label": "启用插件",
+                            "default": True,
+                            "ui_type": "switch",
+                        }
+                    },
+                },
+                "tools": {
+                    "title": "工具开关",
+                    "fields": {
+                        "search": {
+                            "type": "boolean",
+                            "label": "启用互联网搜图工具",
+                            "default": True,
+                            "ui_type": "switch",
+                        },
+                        "get": {
+                            "type": "boolean",
+                            "label": "启用历史图片提取工具",
+                            "default": True,
+                            "ui_type": "switch",
+                        },
+                        "send_context": {
+                            "type": "boolean",
+                            "label": "启用上下文图片发送工具",
+                            "default": True,
+                            "ui_type": "switch",
+                        },
+                    },
+                },
+            },
+            "layout": {"type": "auto", "tabs": []},
+        }
+
+    def _is_tool_enabled(self, tool_name: str) -> bool:
+        """检查插件与指定工具是否启用。"""
+
+        plugin_section = self._plugin_config.get("plugin")
+        tools_section = self._plugin_config.get("tools")
+        if not isinstance(plugin_section, dict) or not bool(plugin_section.get("enabled", True)):
+            return False
+        if not isinstance(tools_section, dict):
+            return True
+        return bool(tools_section.get(tool_name, True))
+
+    def _disabled_tool_result(self, tool_label: str) -> dict[str, Any]:
+        """构造工具关闭时的返回结果。"""
+
+        return {"success": False, "content": f"{tool_label} 已在 better_image 配置中关闭。"}
 
     def _remember_context_image(self, context_key: str, payload: dict[str, Any]) -> None:
         """记录一张可供后续工具复用的上下文图片。"""
@@ -500,6 +655,9 @@ class BetterImagePlugin(MaiBotPlugin):
         """搜索互联网图片并作为工具图片结果返回。"""
 
         del kwargs
+        if not self._is_tool_enabled("search"):
+            return self._disabled_tool_result("互联网搜图工具")
+
         normalized_query = str(query or "").strip()
         if not normalized_query:
             return {"success": False, "content": "better_image_search 需要提供 query。"}
@@ -627,6 +785,9 @@ class BetterImagePlugin(MaiBotPlugin):
         """提取、裁切并放大消息图片。"""
 
         del kwargs
+        if not self._is_tool_enabled("get"):
+            return self._disabled_tool_result("历史图片提取工具")
+
         target_message_id = str(msg_id or "").strip()
         if not target_message_id:
             return {"success": False, "content": "better_image_get 需要提供 msg_id。"}
@@ -720,6 +881,9 @@ class BetterImagePlugin(MaiBotPlugin):
     ) -> dict[str, Any]:
         """发送插件上下文或消息上下文中的图片。"""
 
+        if not self._is_tool_enabled("send_context"):
+            return self._disabled_tool_result("上下文图片发送工具")
+
         image_index = int(kwargs.get("image_index", index) or 0)
         resolved_context_key = str(context_key or "").strip()
         target_message_id = str(msg_id or "").strip()
@@ -776,8 +940,8 @@ class BetterImagePlugin(MaiBotPlugin):
         """处理配置热重载。"""
 
         del scope
-        del config_data
         del version
+        self.set_plugin_config(config_data)
 
 
 def create_plugin() -> BetterImagePlugin:
