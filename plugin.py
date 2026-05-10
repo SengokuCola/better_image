@@ -752,7 +752,8 @@ class BetterImagePlugin(MaiBotPlugin):
             "获取某条历史消息中的图片，根据比例或像素参数裁切、放大，"
             "会将裁切后图片放入上下文以供后续调用,"
             "当你想展示图片中某处信息帮助你向其他人说明使使用,"
-            "当图中某些信息不够清晰时使用,"
+            "当图中某些信息不够清晰时使用。"
+            "！注意，截图完成后请你检查返回的图片是否包含了你想要的信息，并且没有被裁切掉重要部分，必要时可以调整裁切参数重新获取。"
         ),
         parameters=[
             _tool_param("msg_id", ToolParamType.STRING, "包含图片的目标消息编号。"),
@@ -836,6 +837,7 @@ class BetterImagePlugin(MaiBotPlugin):
         content = (
             f"已获取并处理消息 {target_message_id} 的第 {image_index} 张图片，"
             f"上下文图片名称为 {resolved_context_key}，输出尺寸 {metadata['output_width']}x{metadata['output_height']}。"
+            f"请你检查返回的图片是否包含了你想要的信息，并且没有被裁切掉重要部分，必要时可以调整裁切参数重新获取。"
         )
         output_mime_subtype = "jpeg" if processed_format == "jpeg" else processed_format
 
