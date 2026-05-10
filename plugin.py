@@ -4,12 +4,16 @@ from __future__ import annotations
 
 from base64 import b64decode, b64encode
 from io import BytesIO
+from typing import Any
+from urllib.parse import quote_plus, urlparse
+
 from maibot_sdk import MaiBotPlugin, Tool
 from maibot_sdk.types import ToolParameterInfo, ToolParamType
 from PIL import Image
-from typing import Any
 
 import hashlib
+import httpx
+import json
 import logging
 import re
 
@@ -19,6 +23,12 @@ logger = logging.getLogger("plugin.better_image")
 MAX_CONTEXT_IMAGES = 32
 MAX_OUTPUT_EDGE = 4096
 DEFAULT_OUTPUT_FORMAT = "png"
+DEFAULT_SEARCH_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+)
+MAX_SEARCH_IMAGE_BYTES = 8 * 1024 * 1024
+MAX_SEARCH_RESULT_IMAGES = 5
 
 
 def _tool_param(
@@ -121,6 +131,65 @@ def _normalize_output_format(output_format: str) -> str:
     if normalized_format in {"jpeg", "png", "webp"}:
         return normalized_format
     return DEFAULT_OUTPUT_FORMAT
+
+
+def _normalize_downloaded_image(image_bytes: bytes) -> tuple[str, str, dict[str, int]] | None:
+    """校验下载图片并转成工具可稳定消费的 Base64。"""
+
+    try:
+        with Image.open(BytesIO(image_bytes)) as raw_image:
+            raw_image.verify()
+        with Image.open(BytesIO(image_bytes)) as raw_image:
+            image = raw_image.convert("RGBA")
+            output_buffer = BytesIO()
+            image.save(output_buffer, format="PNG")
+            return (
+                DEFAULT_OUTPUT_FORMAT,
+                b64encode(output_buffer.getvalue()).decode("utf-8"),
+                {
+                    "original_width": raw_image.width,
+                    "original_height": raw_image.height,
+                    "output_width": image.width,
+                    "output_height": image.height,
+                },
+            )
+    except Exception:
+        return None
+
+
+def _deduplicate_urls(urls: list[str]) -> list[str]:
+    """按顺序去重并过滤明显不可下载的图片地址。"""
+
+    deduplicated_urls: list[str] = []
+    seen_urls: set[str] = set()
+    for raw_url in urls:
+        image_url = str(raw_url or "").strip()
+        parsed_url = urlparse(image_url)
+        if parsed_url.scheme not in {"http", "https"} or not parsed_url.netloc:
+            continue
+        if image_url in seen_urls:
+            continue
+        seen_urls.add(image_url)
+        deduplicated_urls.append(image_url)
+    return deduplicated_urls
+
+
+def _extract_bing_image_urls(html: str) -> list[str]:
+    """从 Bing 图片搜索结果页中提取原图地址。"""
+
+    urls: list[str] = []
+    for metadata_match in re.finditer(r"m=(\{.+?\})", html):
+        raw_metadata = metadata_match.group(1)
+        try:
+            metadata = json.loads(raw_metadata.replace("&quot;", '"'))
+        except Exception:
+            continue
+        image_url = metadata.get("murl")
+        if isinstance(image_url, str):
+            urls.append(image_url)
+
+    urls.extend(match.group(1) for match in re.finditer(r'"murl"\s*:\s*"([^"]+)"', html))
+    return _deduplicate_urls(urls)
 
 
 def _build_crop_box(
@@ -291,6 +360,233 @@ class BetterImagePlugin(MaiBotPlugin):
             return [], f"目标消息中没有可读取的图片：msg_id={target_message_id}"
 
         return images, None
+
+    async def _search_duckduckgo_image_urls(
+        self,
+        client: httpx.AsyncClient,
+        query: str,
+        *,
+        safe_search: str,
+        candidate_limit: int,
+    ) -> list[str]:
+        """通过 DuckDuckGo 图片搜索收集候选图片地址。"""
+
+        search_url = "https://duckduckgo.com/"
+        search_response = await client.get(
+            search_url,
+            params={"q": query, "iax": "images", "ia": "images"},
+        )
+        search_response.raise_for_status()
+        token_match = re.search(r"vqd=['\"](?P<token>[^'\"]+)['\"]", search_response.text)
+        if token_match is None:
+            return []
+
+        safe_search_value = {"off": "-1", "moderate": "1", "strict": "1"}.get(safe_search, "1")
+        image_response = await client.get(
+            "https://duckduckgo.com/i.js",
+            params={
+                "l": "wt-wt",
+                "o": "json",
+                "q": query,
+                "vqd": token_match.group("token"),
+                "f": ",,,",
+                "p": safe_search_value,
+            },
+            headers={"Referer": str(search_response.url)},
+        )
+        image_response.raise_for_status()
+        payload = image_response.json()
+        results = payload.get("results")
+        if not isinstance(results, list):
+            return []
+
+        image_urls: list[str] = []
+        for result in results[:candidate_limit]:
+            if not isinstance(result, dict):
+                continue
+            image_url = result.get("image")
+            if isinstance(image_url, str):
+                image_urls.append(image_url)
+        return _deduplicate_urls(image_urls)
+
+    async def _search_bing_image_urls(
+        self,
+        client: httpx.AsyncClient,
+        query: str,
+        *,
+        safe_search: str,
+        candidate_limit: int,
+    ) -> list[str]:
+        """通过 Bing 图片搜索页收集候选图片地址。"""
+
+        safe_search_value = {"off": "off", "moderate": "moderate", "strict": "strict"}.get(safe_search, "moderate")
+        response = await client.get(
+            f"https://www.bing.com/images/search?q={quote_plus(query)}&safeSearch={safe_search_value}&form=HDRSC2",
+        )
+        response.raise_for_status()
+        return _extract_bing_image_urls(response.text)[:candidate_limit]
+
+    async def _search_image_urls(
+        self,
+        client: httpx.AsyncClient,
+        query: str,
+        *,
+        safe_search: str,
+        candidate_limit: int,
+    ) -> list[str]:
+        """从多个搜索来源收集候选图片地址。"""
+
+        for search_func in (self._search_duckduckgo_image_urls, self._search_bing_image_urls):
+            try:
+                image_urls = await search_func(
+                    client,
+                    query,
+                    safe_search=safe_search,
+                    candidate_limit=candidate_limit,
+                )
+            except Exception as exc:
+                logger.warning("better_image_search 搜索来源失败：%s", exc)
+                continue
+            if image_urls:
+                return image_urls
+        return []
+
+    async def _download_search_image(
+        self,
+        client: httpx.AsyncClient,
+        image_url: str,
+    ) -> tuple[str, str, dict[str, int]] | None:
+        """下载并规范化搜索结果图片。"""
+
+        try:
+            async with client.stream("GET", image_url) as response:
+                response.raise_for_status()
+                content_type = str(response.headers.get("content-type") or "").lower()
+                if content_type and "image/" not in content_type:
+                    return None
+
+                image_buffer = bytearray()
+                async for chunk in response.aiter_bytes():
+                    image_buffer.extend(chunk)
+                    if len(image_buffer) > MAX_SEARCH_IMAGE_BYTES:
+                        return None
+        except Exception as exc:
+            logger.debug("better_image_search 下载候选图片失败：url=%s, error=%s", image_url, exc)
+            return None
+
+        return _normalize_downloaded_image(bytes(image_buffer))
+
+    @Tool(
+        "better_image_search",
+        description=(
+            "从互联网搜索图片并返回图片结果。适合需要查看网络上的图片、表情包、人物、物品或场景时使用；"
+            "返回的图片会加入插件上下文，之后可以用 better_image_send_context 按 context_key 发送。"
+        ),
+        parameters=[
+            _tool_param("query", ToolParamType.STRING, "图片搜索关键词。"),
+            _tool_param("limit", ToolParamType.INTEGER, "返回图片数量，范围 1 到 5。", False, 3),
+            _tool_param("safe_search", ToolParamType.STRING, "安全搜索级别。", False, "moderate", ["off", "moderate", "strict"]),
+            _tool_param("context_prefix", ToolParamType.STRING, "可选的上下文图片名称前缀，留空则自动生成。", False, ""),
+        ],
+    )
+    async def handle_better_image_search(
+        self,
+        query: str = "",
+        limit: int = 3,
+        safe_search: str = "moderate",
+        context_prefix: str = "",
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """搜索互联网图片并作为工具图片结果返回。"""
+
+        del kwargs
+        normalized_query = str(query or "").strip()
+        if not normalized_query:
+            return {"success": False, "content": "better_image_search 需要提供 query。"}
+
+        normalized_limit = max(1, min(MAX_SEARCH_RESULT_IMAGES, int(limit or 1)))
+        normalized_safe_search = str(safe_search or "moderate").strip().lower()
+        if normalized_safe_search not in {"off", "moderate", "strict"}:
+            normalized_safe_search = "moderate"
+
+        headers = {"User-Agent": DEFAULT_SEARCH_USER_AGENT, "Accept": "text/html,application/json,image/*,*/*"}
+        timeout = httpx.Timeout(15.0, connect=8.0)
+        candidate_limit = max(12, normalized_limit * 6)
+        async with httpx.AsyncClient(headers=headers, timeout=timeout, follow_redirects=True) as client:
+            image_urls = await self._search_image_urls(
+                client,
+                normalized_query,
+                safe_search=normalized_safe_search,
+                candidate_limit=candidate_limit,
+            )
+            if not image_urls:
+                return {"success": False, "content": f"没有搜索到可用图片：{normalized_query}"}
+
+            results: list[dict[str, Any]] = []
+            content_items: list[dict[str, Any]] = []
+            context_prefix_value = str(context_prefix or "").strip()
+            if not context_prefix_value:
+                query_digest = hashlib.sha256(normalized_query.encode("utf-8")).hexdigest()[:8]
+                context_prefix_value = f"search:{query_digest}"
+
+            for image_url in image_urls:
+                if len(results) >= normalized_limit:
+                    break
+
+                downloaded_image = await self._download_search_image(client, image_url)
+                if downloaded_image is None:
+                    continue
+
+                image_format, image_base64, metadata = downloaded_image
+                digest = hashlib.sha256(image_base64.encode("utf-8")).hexdigest()[:12]
+                context_key = f"{context_prefix_value}:{len(results)}:{digest}"
+                self._remember_context_image(
+                    context_key,
+                    {
+                        "format": image_format,
+                        "base64": image_base64,
+                        "source": "internet_search",
+                        "query": normalized_query,
+                        "url": image_url,
+                        "metadata": metadata,
+                    },
+                )
+
+                description = f"搜索“{normalized_query}”得到的第 {len(results)} 张图片，来源：{image_url}"
+                content_items.append(
+                    {
+                        "content_type": "image",
+                        "data": image_base64,
+                        "mime_type": f"image/{image_format}",
+                        "name": f"{context_key}.{image_format}",
+                        "description": description,
+                        "metadata": metadata | {"source_url": image_url, "context_key": context_key},
+                    }
+                )
+                results.append(
+                    {
+                        "context_key": context_key,
+                        "image_format": image_format,
+                        "source_url": image_url,
+                        "metadata": metadata,
+                    }
+                )
+
+        if not results:
+            return {"success": False, "content": f"搜索到了候选图片，但都无法下载或解析：{normalized_query}"}
+
+        content = (
+            f"已搜索“{normalized_query}”并返回 {len(results)} 张图片。"
+            "如需发送其中某张图片，请调用 better_image_send_context 并传入对应 context_key。"
+        )
+        return {
+            "success": True,
+            "content": content,
+            "query": normalized_query,
+            "results": results,
+            "context_keys": [result["context_key"] for result in results],
+            "content_items": content_items,
+        }
 
     @Tool(
         "better_image_get",

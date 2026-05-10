@@ -2,7 +2,7 @@
   "manifest_version": 2,
   "version": "1.0.0",
   "name": "Better Image",
-  "description": "提供从历史消息提取、裁切、放大图片，并发送上下文图片的工具。",
+  "description": "提供互联网搜图、历史消息图片提取、裁切、放大，并发送上下文图片的工具。",
   "author": {
     "name": "SengokuCola",
     "url": "https://github.com/SengokuCola"
@@ -22,7 +22,9 @@
     "min_version": "2.0.0",
     "max_version": "2.99.99"
   },
-  "dependencies": [],
+  "dependencies": [
+    "httpx"
+  ],
   "capabilities": [
     "message.get_by_id",
     "send.image"
