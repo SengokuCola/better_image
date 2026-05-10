@@ -854,7 +854,7 @@ class BetterImagePlugin(MaiBotPlugin):
                     "mime_type": f"image/{output_mime_subtype}",
                     "name": f"{resolved_context_key}.{processed_format}",
                     "description": content,
-                    "metadata": metadata,
+                    "metadata": metadata | {"context_key": resolved_context_key},
                 }
             ],
             "metadata": metadata,
