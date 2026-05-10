@@ -8,19 +8,6 @@
     "url": "https://github.com/SengokuCola"
   },
   "license": "MIT",
-  "homepage_url": "https://github.com/SengokuCola/better_image",
-  "repository_url": "https://github.com/SengokuCola/better_image",
-  "issue_url": "https://github.com/SengokuCola/better_image/issues",
-  "keywords": [
-    "image",
-    "search",
-    "crop",
-    "context"
-  ],
-  "categories": [
-    "多媒体",
-    "实用工具"
-  ],
   "urls": {
     "repository": "https://github.com/SengokuCola/better_image",
     "homepage": "https://github.com/SengokuCola/better_image",
@@ -36,7 +23,11 @@
     "max_version": "2.99.99"
   },
   "dependencies": [
-    "httpx"
+    {
+      "type": "python_package",
+      "name": "httpx",
+      "version_spec": ">=0"
+    }
   ],
   "capabilities": [
     "message.get_by_id",
