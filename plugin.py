@@ -860,19 +860,6 @@ class BetterImagePlugin(MaiBotPlugin):
             "metadata": metadata,
         }
 
-    @Tool(
-        "better_image_send_context",
-        description=(
-            "发送上下文中的图片。可以发送 better_image_get 保存的图片，也可以按 msg_id 和 index "
-            "发送聊天上下文里别人发送的原图；context_key 与 msg_id 二选一。"
-            "同一上下文有多张图片时用 index 指定，从 0 开始；可以连续调用多次发送多张图片。"
-        ),
-        parameters=[
-            _tool_param("context_key", ToolParamType.STRING, "better_image_get 返回的上下文图片名称；与 msg_id 二选一。", False, ""),
-            _tool_param("msg_id", ToolParamType.STRING, "包含图片的上下文消息编号；与 context_key 二选一。", False, ""),
-            _tool_param("index", ToolParamType.INTEGER, "同一消息中的图片序号，从 0 开始。", False, 0),
-        ],
-    )
     async def handle_better_image_send_context(
         self,
         context_key: str = "",
