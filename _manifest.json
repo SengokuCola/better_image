@@ -1,6 +1,6 @@
 {
   "manifest_version": 2,
-  "version": "1.0.0",
+  "version": "1.0.1",
   "name": "Better Image",
   "description": "提供互联网搜图、历史消息图片提取、裁切、放大，并发送上下文图片的工具。",
   "author": {
