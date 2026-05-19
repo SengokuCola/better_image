@@ -25,7 +25,7 @@ logger = logging.getLogger("plugin.better_image")
 MAX_CONTEXT_IMAGES = 32
 MAX_OUTPUT_EDGE = 4096
 DEFAULT_OUTPUT_FORMAT = "png"
-PLUGIN_CONFIG_VERSION = "1.2.0"
+PLUGIN_CONFIG_VERSION = "1.3.0"
 DEFAULT_SEARCH_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
@@ -52,9 +52,8 @@ DEFAULT_PLUGIN_CONFIG: dict[str, Any] = {
     },
     "tools": {
         "search": True,
-        "get": True,
+        "crop": True,
         "transform": True,
-        "send_context": True,
     },
 }
 
@@ -552,7 +551,10 @@ class BetterImagePlugin(MaiBotPlugin):
         plugin_section["config_version"] = PLUGIN_CONFIG_VERSION
 
         tools_section = _ensure_mapping(normalized_config, "tools")
-        for tool_name in ("search", "get", "transform", "send_context"):
+        if "crop" not in tools_section and "get" in tools_section:
+            tools_section["crop"] = tools_section["get"]
+        tools_section.pop("get", None)
+        for tool_name in ("search", "crop", "transform"):
             tools_section[tool_name] = bool(tools_section.get(tool_name, True))
 
         return normalized_config, normalized_config != current_config
@@ -603,21 +605,15 @@ class BetterImagePlugin(MaiBotPlugin):
                             "default": True,
                             "ui_type": "switch",
                         },
-                        "get": {
+                        "crop": {
                             "type": "boolean",
-                            "label": "启用历史图片提取工具",
+                            "label": "启用图片裁切工具",
                             "default": True,
                             "ui_type": "switch",
                         },
                         "transform": {
                             "type": "boolean",
                             "label": "启用图片变换工具",
-                            "default": True,
-                            "ui_type": "switch",
-                        },
-                        "send_context": {
-                            "type": "boolean",
-                            "label": "启用上下文图片发送工具",
                             "default": True,
                             "ui_type": "switch",
                         },
@@ -815,7 +811,7 @@ class BetterImagePlugin(MaiBotPlugin):
         "better_image_search",
         description=(
             "从互联网搜索图片并返回图片结果。适合需要查看网络上的图片、表情包、人物、物品或场景时使用；"
-            "返回的图片会加入插件上下文，之后可以用 better_image_send_context 按 context_key 发送。"
+            "返回的图片会加入插件上下文，之后可以继续用于图片变换。"
         ),
         parameters=[
             _tool_param("query", ToolParamType.STRING, "图片搜索关键词。"),
@@ -915,7 +911,7 @@ class BetterImagePlugin(MaiBotPlugin):
 
         content = (
             f"已搜索“{normalized_query}”并返回 {len(results)} 张图片。"
-            "如需发送其中某张图片，请调用 better_image_send_context 并传入对应 context_key。"
+            "返回的 context_key 可继续用于图片变换。"
         )
         return {
             "success": True,
@@ -927,7 +923,7 @@ class BetterImagePlugin(MaiBotPlugin):
         }
 
     @Tool(
-        "better_image_get",
+        "better_image_crop",
         description=(
             "获取某条历史消息中的图片，根据比例或像素参数裁切、放大，"
             "会将裁切后图片放入上下文以供后续调用,"
@@ -948,7 +944,7 @@ class BetterImagePlugin(MaiBotPlugin):
             _tool_param("context_key", ToolParamType.STRING, "可选的上下文图片名称，留空则自动生成。", False, ""),
         ],
     )
-    async def handle_better_image_get(
+    async def handle_better_image_crop(
         self,
         msg_id: str = "",
         image_index: int = 0,
@@ -966,12 +962,12 @@ class BetterImagePlugin(MaiBotPlugin):
         """提取、裁切并放大消息图片。"""
 
         del kwargs
-        if not self._is_tool_enabled("get"):
-            return self._disabled_tool_result("历史图片提取工具")
+        if not self._is_tool_enabled("crop"):
+            return self._disabled_tool_result("图片裁切工具")
 
         target_message_id = str(msg_id or "").strip()
         if not target_message_id:
-            return {"success": False, "content": "better_image_get 需要提供 msg_id。"}
+            return {"success": False, "content": "better_image_crop 需要提供 msg_id。"}
 
         images, error = await self._get_message_images(target_message_id, stream_id=stream_id)
         if error is not None:
@@ -995,7 +991,7 @@ class BetterImagePlugin(MaiBotPlugin):
                 output_format=output_format,
             )
         except Exception as exc:
-            logger.exception("better_image_get 图片处理失败：msg_id=%s", target_message_id)
+            logger.exception("better_image_crop 图片处理失败：msg_id=%s", target_message_id)
             return {"success": False, "content": f"图片处理失败：{exc}"}
 
         resolved_context_key = str(context_key or "").strip()
@@ -1044,7 +1040,7 @@ class BetterImagePlugin(MaiBotPlugin):
         "better_image_transform",
         description=(
             "对上下文图片或历史消息图片进行变换，支持水平/垂直翻转、顺时针旋转、等比缩放和非等比缩放。"
-            "变换后的图片会放入上下文，可继续用 better_image_send_context 发送。"
+            "变换后的图片会放入上下文，可继续用于后续图片处理。"
         ),
         parameters=[
             _tool_param("context_key", ToolParamType.STRING, "要处理的上下文图片名称；与 msg_id 二选一。", False, ""),
@@ -1170,71 +1166,6 @@ class BetterImagePlugin(MaiBotPlugin):
                 }
             ],
         }
-
-    async def handle_better_image_send_context(
-        self,
-        context_key: str = "",
-        msg_id: str = "",
-        index: int = 0,
-        stream_id: str = "",
-        **kwargs: Any,
-    ) -> dict[str, Any]:
-        """发送插件上下文或消息上下文中的图片。"""
-
-        if not self._is_tool_enabled("send_context"):
-            return self._disabled_tool_result("上下文图片发送工具")
-
-        image_index = int(kwargs.get("image_index", index) or 0)
-        resolved_context_key = str(context_key or "").strip()
-        target_message_id = str(msg_id or "").strip()
-        if bool(resolved_context_key) == bool(target_message_id):
-            return {"success": False, "content": "better_image_send_context 需要在 context_key 和 msg_id 中二选一。"}
-
-        target_stream_id = str(stream_id or "").strip()
-        if not target_stream_id:
-            return {"success": False, "content": "无法确定当前聊天流，不能发送图片。"}
-
-        source_label = resolved_context_key
-        if resolved_context_key:
-            context_image = self._context_images.get(resolved_context_key)
-            if context_image is None:
-                return {"success": False, "content": f"没有找到上下文图片：{resolved_context_key}"}
-            image_base64 = str(context_image["base64"])
-        else:
-            images, error = await self._get_message_images(target_message_id, stream_id=target_stream_id)
-            if error is not None:
-                return {"success": False, "content": error}
-            if image_index < 0 or image_index >= len(images):
-                return {
-                    "success": False,
-                    "content": f"图片序号超出范围：index={image_index}，该消息共有 {len(images)} 张图片。",
-                }
-
-            image_format, image_bytes = images[image_index]
-            image_base64 = b64encode(image_bytes).decode("utf-8")
-            source_label = f"{target_message_id} 的第 {image_index} 张图片"
-
-        success = await self.ctx.send.image(
-            image_base64,
-            target_stream_id,
-            sync_to_maisaka_history=True,
-            maisaka_source_kind="plugin_better_image",
-        )
-        if not success:
-            return {"success": False, "content": f"发送上下文图片失败：{source_label}"}
-
-        result = {
-            "success": True,
-            "content": f"已发送上下文图片：{source_label}",
-            "stream_id": target_stream_id,
-        }
-        if resolved_context_key:
-            result["context_key"] = resolved_context_key
-        else:
-            result["msg_id"] = target_message_id
-            result["index"] = image_index
-            result["image_format"] = image_format
-        return result
 
     async def on_config_update(self, scope: str, config_data: dict[str, object], version: str) -> None:
         """处理配置热重载。"""
