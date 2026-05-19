@@ -496,18 +496,13 @@ class BetterImagePlugin(MaiBotPlugin):
         if not target_message_id:
             return [], "需要提供 msg_id。"
 
-        lookup_result = await self.ctx.call_capability(
-            "message.get_by_id",
-            message_id=target_message_id,
+        message = await self.ctx.message.get_by_id(
+            target_message_id,
             chat_id=str(stream_id or "").strip() or None,
             include_binary_data=True,
         )
-        lookup_payload = _extract_nested_mapping(lookup_result)
-        if lookup_payload and lookup_payload.get("success") is False:
-            return [], str(lookup_payload.get("error") or "读取消息失败。")
 
-        message = lookup_payload.get("message")
-        if not isinstance(message, dict):
+        if not isinstance(message, dict) or not isinstance(message.get("raw_message"), list):
             return [], f"没有找到消息或消息格式异常：msg_id={target_message_id}"
 
         images = _extract_message_images(message)
