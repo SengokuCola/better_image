@@ -1,6 +1,6 @@
 [plugin]
 enabled = true
-config_version = "1.1.0"
+config_version = "1.2.0"
 
 [tools]
 # 是否启用互联网搜图工具 better_image_search
@@ -9,3 +9,4 @@ search = true
 get = true
 # 是否启用上下文图片发送工具 better_image_send_context
 send_context = true
+transform = true

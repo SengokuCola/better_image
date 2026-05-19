@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from asyncio import wait_for
 from base64 import b64decode, b64encode
+from html import unescape
 from io import BytesIO
 from typing import Any, Mapping
 from urllib.parse import quote_plus, urlparse
@@ -23,13 +25,25 @@ logger = logging.getLogger("plugin.better_image")
 MAX_CONTEXT_IMAGES = 32
 MAX_OUTPUT_EDGE = 4096
 DEFAULT_OUTPUT_FORMAT = "png"
-PLUGIN_CONFIG_VERSION = "1.1.0"
+PLUGIN_CONFIG_VERSION = "1.2.0"
 DEFAULT_SEARCH_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 )
 MAX_SEARCH_IMAGE_BYTES = 8 * 1024 * 1024
 MAX_SEARCH_RESULT_IMAGES = 5
+SEARCH_SOURCE_TIMEOUT_SECONDS = 10.0
+GENERIC_SEARCH_TERMS = {
+    "图片",
+    "图",
+    "照片",
+    "壁纸",
+    "高清",
+    "动漫",
+    "二次元",
+    "头像",
+    "表情包",
+}
 
 DEFAULT_PLUGIN_CONFIG: dict[str, Any] = {
     "plugin": {
@@ -39,6 +53,7 @@ DEFAULT_PLUGIN_CONFIG: dict[str, Any] = {
     "tools": {
         "search": True,
         "get": True,
+        "transform": True,
         "send_context": True,
     },
 }
@@ -187,14 +202,83 @@ def _deduplicate_urls(urls: list[str]) -> list[str]:
     return deduplicated_urls
 
 
+def _deduplicate_texts(texts: list[str]) -> list[str]:
+    """按顺序去重文本，保留模型给出的原始搜索意图优先级。"""
+
+    deduplicated_texts: list[str] = []
+    seen_texts: set[str] = set()
+    for text in texts:
+        normalized_text = re.sub(r"\s+", " ", str(text or "")).strip()
+        if not normalized_text or normalized_text in seen_texts:
+            continue
+        seen_texts.add(normalized_text)
+        deduplicated_texts.append(normalized_text)
+    return deduplicated_texts
+
+
+def _contains_cjk(text: str) -> bool:
+    """判断文本是否包含中日韩字符，用于生成中文搜索变体。"""
+
+    return re.search(r"[\u3040-\u30ff\u3400-\u9fff]", text) is not None
+
+
+def _format_exception(exc: Exception) -> str:
+    """格式化异常，避免 TimeoutError 等异常在日志中显示为空。"""
+
+    message = str(exc).strip()
+    if message:
+        return f"{type(exc).__name__}: {message}"
+    return type(exc).__name__
+
+
+def _build_search_query_variants(query: str) -> list[str]:
+    """生成搜索降级变体，降低中文长 query 或泛化词过多导致的空结果率。"""
+
+    normalized_query = re.sub(r"\s+", " ", str(query or "")).strip()
+    if not normalized_query:
+        return []
+
+    parts = [part for part in re.split(r"\s+", normalized_query) if part]
+    variants = [normalized_query]
+    if len(parts) <= 1:
+        trimmed_query = normalized_query
+        if _contains_cjk(trimmed_query):
+            generic_terms = sorted(GENERIC_SEARCH_TERMS, key=len, reverse=True)
+            while True:
+                for generic_term in generic_terms:
+                    if trimmed_query.endswith(generic_term) and len(trimmed_query) > len(generic_term):
+                        trimmed_query = trimmed_query[: -len(generic_term)].strip()
+                        break
+                else:
+                    break
+            if trimmed_query != normalized_query:
+                variants.append(trimmed_query)
+        return _deduplicate_texts(variants)
+
+    trimmed_parts = parts[:]
+    while len(trimmed_parts) > 1 and trimmed_parts[-1] in GENERIC_SEARCH_TERMS:
+        trimmed_parts.pop()
+    if trimmed_parts != parts:
+        variants.append(" ".join(trimmed_parts))
+
+    if len(parts) >= 3:
+        variants.append(" ".join(parts[:2]))
+        variants.append(f"{parts[0]} {parts[-1]}")
+
+    if _contains_cjk(normalized_query):
+        variants.append("".join(parts))
+
+    return _deduplicate_texts(variants)
+
+
 def _extract_bing_image_urls(html: str) -> list[str]:
     """从 Bing 图片搜索结果页中提取原图地址。"""
 
     urls: list[str] = []
-    for metadata_match in re.finditer(r"m=(\{.+?\})", html):
-        raw_metadata = metadata_match.group(1)
+    for metadata_match in re.finditer(r"m=[\"'](?P<metadata>\{.+?\})[\"']", html):
+        raw_metadata = unescape(metadata_match.group("metadata"))
         try:
-            metadata = json.loads(raw_metadata.replace("&quot;", '"'))
+            metadata = json.loads(raw_metadata)
         except Exception:
             continue
         image_url = metadata.get("murl")
@@ -202,6 +286,7 @@ def _extract_bing_image_urls(html: str) -> list[str]:
             urls.append(image_url)
 
     urls.extend(match.group(1) for match in re.finditer(r'"murl"\s*:\s*"([^"]+)"', html))
+    urls.extend(unescape(match.group(1)) for match in re.finditer(r"&quot;murl&quot;\s*:\s*&quot;([^&]+)&quot;", html))
     return _deduplicate_urls(urls)
 
 
@@ -289,6 +374,85 @@ def _crop_and_scale_image(
             "crop_bottom": crop_box[3],
             "output_width": target_width,
             "output_height": target_height,
+        }
+        return normalized_format, b64encode(output_buffer.getvalue()).decode("utf-8"), metadata
+
+
+def _transform_image(
+    image_bytes: bytes,
+    *,
+    flip_horizontal: bool,
+    flip_vertical: bool,
+    rotate_degrees: float,
+    expand: bool,
+    keep_aspect_ratio: bool,
+    scale: float,
+    scale_x: float,
+    scale_y: float,
+    output_format: str,
+) -> tuple[str, str, dict[str, Any]]:
+    """翻转、旋转并缩放图片，返回格式、Base64 与处理元数据。"""
+
+    normalized_format = _normalize_output_format(output_format)
+    with Image.open(BytesIO(image_bytes)) as raw_image:
+        image = raw_image.convert("RGBA")
+        original_width, original_height = image.size
+
+        if flip_horizontal:
+            image = image.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
+        if flip_vertical:
+            image = image.transpose(Image.Transpose.FLIP_TOP_BOTTOM)
+
+        normalized_rotate = float(rotate_degrees or 0.0) % 360.0
+        if normalized_rotate:
+            image = image.rotate(-normalized_rotate, resample=Image.Resampling.BICUBIC, expand=bool(expand))
+        transformed_width, transformed_height = image.size
+
+        if keep_aspect_ratio:
+            normalized_scale = max(0.05, min(8.0, float(scale or 1.0)))
+            target_width = max(1, int(round(image.width * normalized_scale)))
+            target_height = max(1, int(round(image.height * normalized_scale)))
+            largest_edge = max(target_width, target_height)
+            if largest_edge > MAX_OUTPUT_EDGE:
+                edge_scale = MAX_OUTPUT_EDGE / largest_edge
+                target_width = max(1, int(round(target_width * edge_scale)))
+                target_height = max(1, int(round(target_height * edge_scale)))
+            effective_scale_x = target_width / image.width
+            effective_scale_y = target_height / image.height
+        else:
+            normalized_scale_x = max(0.05, min(8.0, float(scale_x or 1.0)))
+            normalized_scale_y = max(0.05, min(8.0, float(scale_y or 1.0)))
+            target_width = max(1, min(MAX_OUTPUT_EDGE, int(round(image.width * normalized_scale_x))))
+            target_height = max(1, min(MAX_OUTPUT_EDGE, int(round(image.height * normalized_scale_y))))
+            effective_scale_x = target_width / image.width
+            effective_scale_y = target_height / image.height
+
+        if (target_width, target_height) != image.size:
+            image = image.resize((target_width, target_height), Image.Resampling.LANCZOS)
+
+        if normalized_format == "jpeg":
+            output_image = image.convert("RGB")
+            pil_format = "JPEG"
+        else:
+            output_image = image
+            pil_format = normalized_format.upper()
+
+        output_buffer = BytesIO()
+        output_image.save(output_buffer, format=pil_format)
+        metadata: dict[str, Any] = {
+            "original_width": original_width,
+            "original_height": original_height,
+            "transformed_width": transformed_width,
+            "transformed_height": transformed_height,
+            "output_width": target_width,
+            "output_height": target_height,
+            "flip_horizontal": bool(flip_horizontal),
+            "flip_vertical": bool(flip_vertical),
+            "rotate_degrees": normalized_rotate,
+            "expand": bool(expand),
+            "keep_aspect_ratio": bool(keep_aspect_ratio),
+            "scale_x": round(effective_scale_x, 4),
+            "scale_y": round(effective_scale_y, 4),
         }
         return normalized_format, b64encode(output_buffer.getvalue()).decode("utf-8"), metadata
 
@@ -388,7 +552,7 @@ class BetterImagePlugin(MaiBotPlugin):
         plugin_section["config_version"] = PLUGIN_CONFIG_VERSION
 
         tools_section = _ensure_mapping(normalized_config, "tools")
-        for tool_name in ("search", "get", "send_context"):
+        for tool_name in ("search", "get", "transform", "send_context"):
             tools_section[tool_name] = bool(tools_section.get(tool_name, True))
 
         return normalized_config, normalized_config != current_config
@@ -442,6 +606,12 @@ class BetterImagePlugin(MaiBotPlugin):
                         "get": {
                             "type": "boolean",
                             "label": "启用历史图片提取工具",
+                            "default": True,
+                            "ui_type": "switch",
+                        },
+                        "transform": {
+                            "type": "boolean",
+                            "label": "启用图片变换工具",
                             "default": True,
                             "ui_type": "switch",
                         },
@@ -586,20 +756,35 @@ class BetterImagePlugin(MaiBotPlugin):
     ) -> list[str]:
         """从多个搜索来源收集候选图片地址。"""
 
-        for search_func in (self._search_duckduckgo_image_urls, self._search_bing_image_urls):
-            try:
-                image_urls = await search_func(
-                    client,
-                    query,
-                    safe_search=safe_search,
-                    candidate_limit=candidate_limit,
-                )
-            except Exception as exc:
-                logger.warning("better_image_search 搜索来源失败：%s", exc)
-                continue
-            if image_urls:
-                return image_urls
-        return []
+        collected_urls: list[str] = []
+        query_variants = _build_search_query_variants(query)
+        for search_query in query_variants:
+            for source_name, search_func in (
+                ("duckduckgo", self._search_duckduckgo_image_urls),
+                ("bing", self._search_bing_image_urls),
+            ):
+                try:
+                    image_urls = await wait_for(
+                        search_func(
+                            client,
+                            search_query,
+                            safe_search=safe_search,
+                            candidate_limit=candidate_limit,
+                        ),
+                        timeout=SEARCH_SOURCE_TIMEOUT_SECONDS,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "better_image_search 搜索来源失败：source=%s, query=%s, error=%s",
+                        source_name,
+                        search_query,
+                        _format_exception(exc),
+                    )
+                    continue
+                collected_urls = _deduplicate_urls(collected_urls + image_urls)
+                if len(collected_urls) >= candidate_limit:
+                    return collected_urls[:candidate_limit]
+        return collected_urls
 
     async def _download_search_image(
         self,
@@ -621,7 +806,7 @@ class BetterImagePlugin(MaiBotPlugin):
                     if len(image_buffer) > MAX_SEARCH_IMAGE_BYTES:
                         return None
         except Exception as exc:
-            logger.debug("better_image_search 下载候选图片失败：url=%s, error=%s", image_url, exc)
+            logger.debug("better_image_search 下载候选图片失败：url=%s, error=%s", image_url, _format_exception(exc))
             return None
 
         return _normalize_downloaded_image(bytes(image_buffer))
@@ -853,6 +1038,137 @@ class BetterImagePlugin(MaiBotPlugin):
                 }
             ],
             "metadata": metadata,
+        }
+
+    @Tool(
+        "better_image_transform",
+        description=(
+            "对上下文图片或历史消息图片进行变换，支持水平/垂直翻转、顺时针旋转、等比缩放和非等比缩放。"
+            "变换后的图片会放入上下文，可继续用 better_image_send_context 发送。"
+        ),
+        parameters=[
+            _tool_param("context_key", ToolParamType.STRING, "要处理的上下文图片名称；与 msg_id 二选一。", False, ""),
+            _tool_param("msg_id", ToolParamType.STRING, "包含图片的目标消息编号；与 context_key 二选一。", False, ""),
+            _tool_param("image_index", ToolParamType.INTEGER, "使用 msg_id 时，同一消息中第几张图片，从 0 开始。", False, 0),
+            _tool_param("flip_horizontal", ToolParamType.BOOLEAN, "是否水平翻转图片。", False, False),
+            _tool_param("flip_vertical", ToolParamType.BOOLEAN, "是否垂直翻转图片。", False, False),
+            _tool_param("rotate_degrees", ToolParamType.FLOAT, "顺时针旋转角度，支持任意数值。", False, 0.0),
+            _tool_param("expand", ToolParamType.BOOLEAN, "旋转时是否扩展画布以保留完整图片。", False, True),
+            _tool_param("keep_aspect_ratio", ToolParamType.BOOLEAN, "是否等比缩放；为 false 时使用 scale_x 和 scale_y。", False, True),
+            _tool_param("scale", ToolParamType.FLOAT, "等比缩放倍率，范围会限制在 0.05 到 8.0。", False, 1.0),
+            _tool_param("scale_x", ToolParamType.FLOAT, "非等比缩放的横向倍率，范围会限制在 0.05 到 8.0。", False, 1.0),
+            _tool_param("scale_y", ToolParamType.FLOAT, "非等比缩放的纵向倍率，范围会限制在 0.05 到 8.0。", False, 1.0),
+            _tool_param("output_format", ToolParamType.STRING, "输出格式。", False, DEFAULT_OUTPUT_FORMAT, ["png", "jpeg", "webp"]),
+            _tool_param("output_context_key", ToolParamType.STRING, "可选的输出上下文图片名称，留空则自动生成。", False, ""),
+        ],
+    )
+    async def handle_better_image_transform(
+        self,
+        context_key: str = "",
+        msg_id: str = "",
+        image_index: int = 0,
+        flip_horizontal: bool = False,
+        flip_vertical: bool = False,
+        rotate_degrees: float = 0.0,
+        expand: bool = True,
+        keep_aspect_ratio: bool = True,
+        scale: float = 1.0,
+        scale_x: float = 1.0,
+        scale_y: float = 1.0,
+        output_format: str = DEFAULT_OUTPUT_FORMAT,
+        output_context_key: str = "",
+        stream_id: str = "",
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """变换上下文图片或消息图片。"""
+
+        del kwargs
+        if not self._is_tool_enabled("transform"):
+            return self._disabled_tool_result("图片变换工具")
+
+        source_context_key = str(context_key or "").strip()
+        target_message_id = str(msg_id or "").strip()
+        if bool(source_context_key) == bool(target_message_id):
+            return {"success": False, "content": "better_image_transform 需要在 context_key 和 msg_id 中二选一。"}
+
+        source_label = source_context_key
+        if source_context_key:
+            context_image = self._context_images.get(source_context_key)
+            if context_image is None:
+                return {"success": False, "content": f"没有找到上下文图片：{source_context_key}"}
+            decoded_image = _decode_base64_image(str(context_image.get("base64") or ""))
+            if decoded_image is None:
+                return {"success": False, "content": f"上下文图片数据不可解析：{source_context_key}"}
+            _source_format, source_bytes = decoded_image
+        else:
+            images, error = await self._get_message_images(target_message_id, stream_id=stream_id)
+            if error is not None:
+                return {"success": False, "content": error}
+            if image_index < 0 or image_index >= len(images):
+                return {
+                    "success": False,
+                    "content": f"图片序号超出范围：image_index={image_index}，该消息共有 {len(images)} 张图片。",
+                }
+            _source_format, source_bytes = images[image_index]
+            source_label = f"{target_message_id} 的第 {image_index} 张图片"
+
+        try:
+            transformed_format, transformed_base64, metadata = _transform_image(
+                source_bytes,
+                flip_horizontal=bool(flip_horizontal),
+                flip_vertical=bool(flip_vertical),
+                rotate_degrees=float(rotate_degrees or 0.0),
+                expand=bool(expand),
+                keep_aspect_ratio=bool(keep_aspect_ratio),
+                scale=float(scale or 1.0),
+                scale_x=float(scale_x or 1.0),
+                scale_y=float(scale_y or 1.0),
+                output_format=output_format,
+            )
+        except Exception as exc:
+            logger.exception("better_image_transform 图片处理失败：source=%s", source_label)
+            return {"success": False, "content": f"图片变换失败：{exc}"}
+
+        resolved_context_key = str(output_context_key or "").strip()
+        if not resolved_context_key:
+            digest = hashlib.sha256(transformed_base64.encode("utf-8")).hexdigest()[:12]
+            resolved_context_key = f"transform:{digest}"
+
+        self._remember_context_image(
+            resolved_context_key,
+            {
+                "format": transformed_format,
+                "base64": transformed_base64,
+                "source": "image_transform",
+                "source_context_key": source_context_key,
+                "message_id": target_message_id,
+                "image_index": image_index,
+                "metadata": metadata,
+            },
+        )
+
+        content = (
+            f"已变换图片 {source_label}，上下文图片名称为 {resolved_context_key}，"
+            f"输出尺寸 {metadata['output_width']}x{metadata['output_height']}。"
+        )
+        output_mime_subtype = "jpeg" if transformed_format == "jpeg" else transformed_format
+        return {
+            "success": True,
+            "content": content,
+            "context_key": resolved_context_key,
+            "image_format": transformed_format,
+            "image_base64": transformed_base64,
+            "metadata": metadata,
+            "content_items": [
+                {
+                    "content_type": "image",
+                    "data": transformed_base64,
+                    "mime_type": f"image/{output_mime_subtype}",
+                    "name": f"{resolved_context_key}.{transformed_format}",
+                    "description": content,
+                    "metadata": metadata | {"context_key": resolved_context_key},
+                }
+            ],
         }
 
     async def handle_better_image_send_context(

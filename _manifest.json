@@ -1,8 +1,8 @@
 {
   "manifest_version": 2,
-  "version": "1.0.2",
+  "version": "1.1.0",
   "name": "Better Image",
-  "description": "提供互联网搜图、历史消息图片提取、裁切、放大，并发送上下文图片的工具。",
+  "description": "提供互联网搜图、历史消息图片提取、裁切、放大、翻转、旋转、缩放，并发送上下文图片的工具。",
   "author": {
     "name": "SengokuCola",
     "url": "https://github.com/SengokuCola"
