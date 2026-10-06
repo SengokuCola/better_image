@@ -1,34 +1,47 @@
 # Better Image
 
-Better Image 是一个 MaiBot 插件，提供互联网搜图、历史消息图片提取、裁切放大和图片变换能力。
+Better Image 是一个 MaiBot 插件，提供互联网搜图、历史消息图片提取和裁切放大能力。
 
-当前版本：`1.1.1`
+当前版本：`1.1.4`，支持 MaiBot `1.3.4–1.3.x` 和插件 SDK `2.9.x`。
 
 ## 功能
 
-- `better_image_search`：从互联网搜索图片并以工具图片结果返回。
-- `better_image_crop`：从历史消息中读取图片，按比例或像素裁切、放大，并保存到插件上下文。
-- `better_image_transform`：翻转、旋转、等比缩放或非等比缩放上下文图片/历史消息图片，并保存到插件上下文。
-- 支持在 `config.toml` 中分别启用或关闭上述三个工具。
+- `image_search`：从互联网搜索图片并以工具图片结果返回；支持 DuckDuckGo、Bing 和 Safebooru。
+- `image_crop`：从历史消息中读取图片，按比例或像素裁切、放大，并保存到插件上下文。
+- 支持在 `config.toml` 中分别启用或关闭上述两个工具。
 
 ## 配置
 
 ```toml
 [plugin]
 enabled = true
-config_version = "1.3.0"
+config_version = "1.4.0"
 
 [tools]
 search = true
 crop = true
-transform = true
 ```
 
 ## 使用说明
 
-安装后启用插件即可使用工具。互联网搜图依赖公开搜索页面，结果可用性会受网络环境和搜索源限制。
+安装后启用插件即可使用工具。`image_search` 的 `source` 参数可设为 `auto`、`duckduckgo`、`bing` 或 `safebooru`。Safebooru 使用英文标签搜索，例如 `hatsune_miku`；`auto` 会在其他图源结果不足时查询 Safebooru。互联网搜图依赖公开接口和页面，结果可用性会受网络环境和搜索源限制。
 
 ## 更新记录
+
+### 1.1.4
+
+- 适配 MaiBot 1.3.4 / 插件 SDK 2.9.0 的工具简要描述与详细说明。
+- 图片下载解析、裁切和放大在线程中执行，避免阻塞插件事件循环。
+- 消息查询失败时保留具体错误，补齐 Pillow 依赖声明。
+- 本次发布同时包含此前本地更新：新增 Safebooru 图源，工具改为 `image_search` / `image_crop`，移除图片变换工具。
+
+### 1.1.3
+
+- 适配 MaiBot 1.2.x。
+
+### 1.1.2
+
+- 适配 MaiBot 1.1.x。
 
 ### 1.1.1
 

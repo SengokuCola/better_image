@@ -1,8 +1,7 @@
 [plugin]
 enabled = true
-config_version = "1.3.0"
+config_version = "1.4.0"
 
 [tools]
 search = true
 crop = true
-transform = true
