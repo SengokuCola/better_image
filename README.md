@@ -2,7 +2,7 @@
 
 Better Image 是一个 MaiBot 插件，提供互联网搜图、历史消息图片提取和裁切放大能力。
 
-当前版本：`1.1.4`，支持 MaiBot `1.3.4–1.3.x` 和插件 SDK `2.9.x`。
+当前版本：`1.1.5`，支持 MaiBot `1.3.0–1.3.99` 和插件 SDK `2.9.x`。
 
 ## 功能
 
@@ -11,6 +11,8 @@ Better Image 是一个 MaiBot 插件，提供互联网搜图、历史消息图�
 - 支持在 `config.toml` 中分别启用或关闭上述两个工具。
 
 ## 配置
+
+仓库与发布包只提供 `config.template.toml` 配置模板。首次加载时插件会生成 `config.toml`，也可以复制模板为 `config.toml` 后修改；实际配置文件不纳入 Git。
 
 ```toml
 [plugin]
@@ -27,6 +29,11 @@ crop = true
 安装后启用插件即可使用工具。`image_search` 的 `source` 参数可设为 `auto`、`duckduckgo`、`bing` 或 `safebooru`。Safebooru 使用英文标签搜索，例如 `hatsune_miku`；`auto` 会在其他图源结果不足时查询 Safebooru。互联网搜图依赖公开接口和页面，结果可用性会受网络环境和搜索源限制。
 
 ## 更新记录
+
+### 1.1.5
+
+- 发布包只包含 `config.template.toml`，停止跟踪实际 `config.toml`。
+- 主程序兼容范围修正为 MaiBot `1.3.0–1.3.99`。
 
 ### 1.1.4
 
